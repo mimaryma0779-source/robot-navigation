@@ -1,0 +1,813 @@
+import heapq
+import math
+import random
+from collections import deque
+from time import perf_counter
+
+import pygame
+
+# Sous Windows : évite que la fenêtre soit agrandie/déformée par la mise à l'échelle
+try:
+    import ctypes
+    ctypes.windll.user32.SetProcessDPIAware()
+except Exception:
+    pass
+
+pygame.init()
+_info = pygame.display.Info()
+ECRAN_L = _info.current_w if _info.current_w > 0 else 1366
+ECRAN_H = _info.current_h if _info.current_h > 0 else 768
+
+# ------------------------------------------------------------
+# Réglages
+# ------------------------------------------------------------
+HAUTEUR_BARRE = 0             # plus de barre en bas : le bouton Démarrer est en haut du panneau
+DEC = 66                      # décalage vertical (place pour le message + bouton Démarrer)
+LARGEUR_PANNEAU = 290
+HAUTEUR_MIN_PANNEAU = 540 + DEC     # le panneau de droite a besoin de cette hauteur
+LARGEUR_MIN_GRILLE = 420      # pour que la barre du bas reste lisible
+VITESSE = 4
+SQRT2 = math.sqrt(2)
+
+# Limites de temps de calcul proposées (en millisecondes)
+LIMITES_MS = [0.05, 1, 5, 20, 100, 1000]
+
+NOMS_ALGOS = ["BFS", "Dijkstra", "A*", "Glouton"]
+BFS, DIJKSTRA, ASTAR, GLOUTON = 0, 1, 2, 3
+
+# Taille de la grille (modifiable ensuite depuis le panneau de droite)
+MIN_TAILLE, MAX_TAILLE = 3, 40
+nb_lignes = 10
+nb_colonnes = 14
+densite_pct = 20           # pourcentage de meubles (0 à 40)
+
+# Ces valeurs sont recalculées par calculer_dimensions()
+TAILLE_CASE = 40
+LARGEUR_PIX = HAUTEUR_PIX = 0
+LARGEUR_ZONE = HAUTEUR_ZONE = 0
+LARGEUR = HAUTEUR = 0
+
+
+def calculer_dimensions():
+    """Fenêtre de taille FIXE : ce sont les cases qui s'adaptent
+    (plus il y a de lignes/colonnes, plus les cases sont petites)."""
+    global TAILLE_CASE, LARGEUR_PIX, HAUTEUR_PIX
+    global LARGEUR_ZONE, HAUTEUR_ZONE, LARGEUR, HAUTEUR
+    # Taille « logique » constante : la fenêtre réelle peut être redimensionnée,
+    # l'image est alors réduite/agrandie pour tout garder visible.
+    LARGEUR_ZONE = 800
+    HAUTEUR_ZONE = HAUTEUR_MIN_PANNEAU
+    LARGEUR = LARGEUR_ZONE + LARGEUR_PANNEAU
+    HAUTEUR = HAUTEUR_ZONE + HAUTEUR_BARRE
+    TAILLE_CASE = max(10, min(80, LARGEUR_ZONE // nb_colonnes, HAUTEUR_ZONE // nb_lignes))
+    LARGEUR_PIX = nb_colonnes * TAILLE_CASE      # taille réelle de la grille
+    HAUTEUR_PIX = nb_lignes * TAILLE_CASE
+
+
+calculer_dimensions()
+
+# 0 = libre, 1 = meuble (obstacle)
+grille = [[0] * nb_colonnes for _ in range(nb_lignes)]
+
+depart = (0, 0)                                # position de la station / du robot
+prise = (nb_lignes - 1, nb_colonnes - 1)       # la prise à atteindre
+
+# ------------------------------------------------------------
+# Couleurs
+# ------------------------------------------------------------
+FOND = (205, 190, 165)
+SOL_1 = (240, 224, 192)
+SOL_2 = (228, 206, 168)
+LIGNE_GRILLE = (95, 70, 45)
+COULEUR_MATRICE = (60, 45, 30)
+MEUBLE = (110, 80, 55)
+MEUBLE_BORD = (65, 45, 30)
+MEUBLE_REFLET = (150, 115, 85)
+ROBOT_CORPS = (235, 235, 240)
+ROBOT_DESSUS = (70, 75, 85)
+ROBOT_OMBRE = (150, 130, 105)
+LED_VERTE = (70, 230, 110)
+CONTOUR = (35, 40, 50)
+PRISE_PLAQUE = (250, 250, 245)
+PRISE_TROU = (40, 40, 45)
+PRISE_ECLAIR = (255, 190, 0)
+CHEMIN = (0, 140, 210)
+CHEMIN_PARTIEL = (170, 60, 200)
+BARRE = (22, 40, 48)
+PANNEAU = (20, 34, 42)
+TEXTE = (240, 245, 245)
+TEXTE_DISCRET = (150, 175, 180)
+BOUTON = (30, 150, 130)
+BOUTON_SURVOL = (45, 185, 160)
+BOUTON_GRIS = (95, 110, 115)
+BOUTON_PANNEAU = (45, 70, 80)
+BOUTON_ACTIF = (0, 140, 210)
+
+
+def rect(x, y, largeur, hauteur):
+    return pygame.Rect(int(x), int(y), int(largeur), int(hauteur))
+
+
+# ------------------------------------------------------------
+# Outils sur la grille
+# ------------------------------------------------------------
+def libre(ligne, colonne):
+    return (0 <= ligne < nb_lignes and 0 <= colonne < nb_colonnes
+            and grille[ligne][colonne] == 0)
+
+
+def voisins(case, diagonales):
+    """Cases voisines accessibles, avec le coût du pas (1 ou racine de 2).
+    Une diagonale est interdite si elle 'coupe le coin' d'un meuble."""
+    ligne, colonne = case
+    for dl, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+        if libre(ligne + dl, colonne + dc):
+            yield (ligne + dl, colonne + dc), 1.0
+    if diagonales:
+        for dl, dc in [(-1, -1), (-1, 1), (1, -1), (1, 1)]:
+            if (libre(ligne + dl, colonne + dc)
+                    and libre(ligne + dl, colonne)
+                    and libre(ligne, colonne + dc)):
+                yield (ligne + dl, colonne + dc), SQRT2
+
+
+def pas_valide(a, b):
+    """Le pas a -> b est-il toujours possible avec la grille actuelle ?"""
+    if not libre(b[0], b[1]):
+        return False
+    if a[0] != b[0] and a[1] != b[1]:   # pas diagonal : pas de coin coupé
+        return libre(a[0], b[1]) and libre(b[0], a[1])
+    return True
+
+
+def chemin_valide(chemin, debut):
+    """Vérifie les pas de chemin[debut-1] jusqu'à la fin."""
+    for i in range(max(debut, 1), len(chemin)):
+        if not pas_valide(chemin[i - 1], chemin[i]):
+            return False
+    return True
+
+
+def heuristique(case, but, diagonales):
+    """Distance estimée jusqu'au but (ne surestime jamais -> A* optimal)."""
+    dl = abs(case[0] - but[0])
+    dc = abs(case[1] - but[1])
+    if diagonales:
+        return (dl + dc) + (SQRT2 - 2) * min(dl, dc)   # distance « octile »
+    return dl + dc                                      # distance de Manhattan
+
+
+def cout_chemin(chemin):
+    total = 0.0
+    for i in range(1, len(chemin)):
+        total += math.hypot(chemin[i][0] - chemin[i - 1][0],
+                            chemin[i][1] - chemin[i - 1][1])
+    return total
+
+
+# ------------------------------------------------------------
+# Recherche du chemin : BFS / Dijkstra / A* / Glouton
+# avec un temps de calcul borné
+# ------------------------------------------------------------
+def rechercher(algo, source, but, diagonales, limite_ms):
+    """
+    Renvoie un dictionnaire :
+      chemin   : liste de cases (vide si aucun chemin)
+      cout     : longueur du chemin
+      explores : nombre de cases développées
+      temps    : temps de calcul en ms
+      statut   : "ok" (chemin complet), "partiel" (temps dépassé) ou "aucun"
+      zone     : ensemble des cases développées (pour l'affichage)
+    Si le temps est dépassé, on renvoie le chemin vers la case développée
+    la plus proche du but : le robot avance quand même, puis on recalcule.
+    """
+    t0 = perf_counter()
+    limite = limite_ms / 1000.0
+
+    precedent = {source: None}
+    g = {source: 0.0}
+    developpees = set()
+    trouve = False
+    statut = "ok"
+    compteur = 0   # départage les égalités dans le tas
+
+    if algo == BFS:
+        ouvert = deque([source])
+    else:
+        ouvert = [(0.0, 0, source)]
+
+    while ouvert:
+        if perf_counter() - t0 > limite:
+            statut = "partiel"
+            break
+
+        if algo == BFS:
+            actuel = ouvert.popleft()
+        else:
+            _, _, actuel = heapq.heappop(ouvert)
+            if actuel in developpees:
+                continue
+        developpees.add(actuel)
+
+        if actuel == but:
+            trouve = True
+            break
+
+        for voisin, pas in voisins(actuel, diagonales):
+            nouveau_g = g[actuel] + pas
+            if algo == BFS:
+                if voisin not in precedent:
+                    precedent[voisin] = actuel
+                    g[voisin] = nouveau_g
+                    ouvert.append(voisin)
+            else:
+                if voisin in g and (algo == GLOUTON or nouveau_g >= g[voisin] - 1e-12):
+                    continue
+                g[voisin] = nouveau_g
+                precedent[voisin] = actuel
+                h = heuristique(voisin, but, diagonales)
+                if algo == DIJKSTRA:
+                    priorite = nouveau_g
+                elif algo == ASTAR:
+                    priorite = nouveau_g + h
+                else:
+                    priorite = h
+                compteur += 1
+                heapq.heappush(ouvert, (priorite, compteur, voisin))
+
+    temps = (perf_counter() - t0) * 1000.0
+
+    if trouve:
+        fin = but
+    elif statut == "partiel":
+        if developpees:
+            fin = min(developpees, key=lambda c: (heuristique(c, but, diagonales), g[c]))
+        else:
+            fin = source
+    else:
+        return {"chemin": [], "cout": 0.0, "explores": len(developpees),
+                "temps": temps, "statut": "aucun", "zone": developpees}
+
+    chemin = []
+    case = fin
+    while case is not None:
+        chemin.append(case)
+        case = precedent[case]
+    chemin.reverse()
+    return {"chemin": chemin, "cout": cout_chemin(chemin),
+            "explores": len(developpees), "temps": temps,
+            "statut": statut, "zone": developpees}
+
+
+def comparer_algos(source, but, diagonales, limite_ms, repetitions=20):
+    """Lance les 4 algorithmes sur la grille actuelle (temps moyen sur plusieurs essais)."""
+    resultats = []
+    for algo in range(4):
+        total = 0.0
+        res = None
+        for _ in range(repetitions):
+            res = rechercher(algo, source, but, diagonales, limite_ms)
+            total += res["temps"]
+        resultats.append((NOMS_ALGOS[algo], total / repetitions,
+                          res["cout"], res["explores"], res["statut"]))
+    print("\n--- Comparaison (diagonales : %s, limite : %s ms) ---" % (diagonales, limite_ms))
+    print("%-10s %10s %10s %10s  %s" % ("Algo", "Temps ms", "Longueur", "Explorees", "Statut"))
+    for nom, t, c, e, s in resultats:
+        print("%-10s %10.3f %10.2f %10d  %s" % (nom, t, c, e, s))
+    return resultats
+
+
+# ------------------------------------------------------------
+# Dessin
+# ------------------------------------------------------------
+def dessiner_sol(fenetre, x, y, ligne, colonne):
+    couleur = SOL_1 if (ligne + colonne) % 2 == 0 else SOL_2
+    pygame.draw.rect(fenetre, couleur, rect(x, y, TAILLE_CASE, TAILLE_CASE))
+
+
+def dessiner_meuble(fenetre, x, y):
+    t = TAILLE_CASE
+    pygame.draw.rect(fenetre, MEUBLE_BORD, rect(x + 2, y + 2, t - 4, t - 4), border_radius=6)
+    pygame.draw.rect(fenetre, MEUBLE, rect(x + t * 0.1, y + t * 0.1, t * 0.8, t * 0.8), border_radius=5)
+    pygame.draw.line(fenetre, MEUBLE_REFLET,
+                     (x + t * 0.2, y + t * 0.22), (x + t * 0.8, y + t * 0.22), 3)
+
+
+def dessiner_prise(fenetre, x, y):
+    t = TAILLE_CASE
+    plaque = rect(x + t * 0.15, y + t * 0.12, t * 0.7, t * 0.76)
+    pygame.draw.rect(fenetre, PRISE_PLAQUE, plaque, border_radius=8)
+    pygame.draw.rect(fenetre, CONTOUR, plaque, 2, border_radius=8)
+    # les deux fentes
+    pygame.draw.rect(fenetre, PRISE_TROU, rect(x + t * 0.33, y + t * 0.26, t * 0.09, t * 0.22), border_radius=2)
+    pygame.draw.rect(fenetre, PRISE_TROU, rect(x + t * 0.58, y + t * 0.26, t * 0.09, t * 0.22), border_radius=2)
+    # le trou de terre
+    pygame.draw.circle(fenetre, PRISE_TROU, (int(x + t * 0.5), int(y + t * 0.68)), max(2, int(t * 0.06)))
+    # petit éclair
+    eclair = [(x + t * 0.52, y + t * 0.5), (x + t * 0.45, y + t * 0.6), (x + t * 0.5, y + t * 0.6),
+              (x + t * 0.47, y + t * 0.72)]
+    pygame.draw.lines(fenetre, PRISE_ECLAIR, False, eclair, 2)
+
+
+def dessiner_robot(fenetre, x, y):
+    t = TAILLE_CASE
+    cx = int(x + t / 2)
+    cy = int(y + t / 2)
+    r = int(t * 0.38)
+    pygame.draw.circle(fenetre, ROBOT_OMBRE, (cx + 2, cy + 3), r)      # ombre
+    pygame.draw.circle(fenetre, ROBOT_CORPS, (cx, cy), r)              # corps
+    pygame.draw.circle(fenetre, CONTOUR, (cx, cy), r, 2)
+    pygame.draw.circle(fenetre, ROBOT_DESSUS, (cx, cy), int(r * 0.6))  # dessus
+    pygame.draw.circle(fenetre, LED_VERTE, (cx, cy), max(2, int(t * 0.07)))   # voyant
+    pygame.draw.line(fenetre, CONTOUR, (cx - int(r * 0.35), cy - int(r * 0.85)),
+                     (cx + int(r * 0.35), cy - int(r * 0.85)), 3)      # capteur avant
+
+
+def dessiner_lignes_grille(fenetre):
+    for c in range(nb_colonnes + 1):
+        x = c * TAILLE_CASE
+        pygame.draw.line(fenetre, LIGNE_GRILLE, (x, 0), (x, HAUTEUR_PIX), 2)
+    for l in range(nb_lignes + 1):
+        y = l * TAILLE_CASE
+        pygame.draw.line(fenetre, LIGNE_GRILLE, (0, y), (LARGEUR_PIX, y), 2)
+    pygame.draw.rect(fenetre, MEUBLE_BORD, rect(0, 0, LARGEUR_PIX, HAUTEUR_PIX), 4)
+
+
+def dessiner_matrice(fenetre, police):
+    """Écrit 0 (libre) ou 1 (meuble) au centre de chaque case."""
+    for l in range(nb_lignes):
+        for c in range(nb_colonnes):
+            valeur = grille[l][c]
+            couleur = (255, 255, 255) if valeur == 1 else COULEUR_MATRICE
+            image = police.render(str(valeur), True, couleur)
+            centre = (c * TAILLE_CASE + TAILLE_CASE // 2, l * TAILLE_CASE + TAILLE_CASE // 2)
+            fenetre.blit(image, image.get_rect(center=centre))
+
+
+def dessiner_chemin(fenetre, points, couleur):
+    if len(points) < 2:
+        return
+    pygame.draw.lines(fenetre, couleur, False, points, 5)
+    for point in points[1:]:
+        pygame.draw.circle(fenetre, couleur, point, 5)
+
+
+def centre_case(ligne, colonne):
+    return (colonne * TAILLE_CASE + TAILLE_CASE // 2,
+            ligne * TAILLE_CASE + TAILLE_CASE // 2)
+
+
+def dessiner_bouton(fenetre, police, zone, texte, couleur):
+    pygame.draw.rect(fenetre, couleur, zone, border_radius=8)
+    pygame.draw.rect(fenetre, TEXTE, zone, 1, border_radius=8)
+    label = police.render(texte, True, TEXTE)
+    fenetre.blit(label, label.get_rect(center=zone.center))
+
+
+# ------------------------------------------------------------
+# Initialisation
+# ------------------------------------------------------------
+pygame.init()
+# La fenêtre réelle est redimensionnable et démarre à une taille qui tient dans l'écran.
+# On dessine sur une « toile » de taille fixe (fenetre), affichée à l'échelle.
+_echelle0 = min(2.0, 0.9 * ECRAN_L / LARGEUR, 0.8 * ECRAN_H / HAUTEUR)
+pygame.display.set_mode((int(LARGEUR * _echelle0), int(HAUTEUR * _echelle0)), pygame.RESIZABLE)
+fenetre = pygame.Surface((LARGEUR, HAUTEUR))
+
+
+def geometrie_affichage():
+    """Écran réel, échelle, décalage et taille de la toile affichée."""
+    ecran = pygame.display.get_surface()
+    ew, eh = ecran.get_size()
+    echelle = min(ew / LARGEUR, eh / HAUTEUR)
+    w, h = max(1, int(LARGEUR * echelle)), max(1, int(HAUTEUR * echelle))
+    return ecran, echelle, ((ew - w) // 2, (eh - h) // 2), (w, h)
+
+
+def vers_logique(pos):
+    """Convertit une position de souris (fenêtre réelle) en position sur la toile."""
+    _, echelle, (ox, oy), _ = geometrie_affichage()
+    return (int((pos[0] - ox) / echelle), int((pos[1] - oy) / echelle))
+
+
+pygame.display.set_caption("Robot aspirateur - À la recherche de sa prise")
+horloge = pygame.time.Clock()
+police = pygame.font.SysFont("arial", 20, bold=True)
+police_petite = pygame.font.SysFont("arial", 15)
+police_petite_gras = pygame.font.SysFont("arial", 15, bold=True)
+
+# Positions des boutons (recalculées quand la fenêtre change de taille)
+bouton = None
+PX = 0
+boutons_panneau = {}
+
+# Positions verticales des réglages (limite, lignes, colonnes, meubles)
+Y_LIMITE, Y_LIGNES, Y_COLONNES, Y_DENSITE = DEC + 190, DEC + 220, DEC + 250, DEC + 280
+
+
+def creer_boutons():
+    global bouton, PX, boutons_panneau
+    PX_ = LARGEUR_ZONE + 15
+    bouton = pygame.Rect(PX_, 26, 260, 34)
+
+    PX = LARGEUR_ZONE + 15
+    boutons_panneau = {}
+    for i in range(4):
+        boutons_panneau["algo%d" % i] = pygame.Rect(PX + (i % 2) * 135, DEC + 28 + (i // 2) * 30, 125, 26)
+    boutons_panneau["diag"] = pygame.Rect(PX, DEC + 94, 260, 26)
+    boutons_panneau["zone"] = pygame.Rect(PX, DEC + 124, 260, 26)
+    boutons_panneau["comparer"] = pygame.Rect(PX, DEC + 154, 125, 26)
+    boutons_panneau["alea"] = pygame.Rect(PX + 135, DEC + 154, 125, 26)
+    for prefixe, y_ in (("", Y_LIMITE), ("l_", Y_LIGNES), ("c_", Y_COLONNES), ("d_", Y_DENSITE)):
+        boutons_panneau[prefixe + "moins"] = pygame.Rect(PX + 170, y_, 40, 26)
+        boutons_panneau[prefixe + "plus"] = pygame.Rect(PX + 220, y_, 40, 26)
+
+
+creer_boutons()
+
+# Paramètres modifiables
+algo = ASTAR
+diagonales = False
+montrer_zone = True
+montrer_matrice = False
+indice_limite = 3          # 20 ms par défaut
+comparaison = []
+
+# État du robot
+etat = "attente"           # "attente", "en_route", "coince", "arrive"
+chemin = []
+index = 1
+stats = None               # résultat de la dernière recherche
+zone_explorée = set()
+robot_x = depart[1] * TAILLE_CASE
+robot_y = depart[0] * TAILLE_CASE
+
+
+def limite_ms():
+    return LIMITES_MS[indice_limite]
+
+
+def appliquer_resultat(res):
+    """Mémorise le résultat d'une recherche pour l'affichage."""
+    global stats, zone_explorée
+    stats = res
+    zone_explorée = res["zone"]
+
+
+def reinitialiser():
+    """Remet le robot au départ et recalcule le chemin."""
+    global etat, chemin, index, robot_x, robot_y
+    robot_x = depart[1] * TAILLE_CASE
+    robot_y = depart[0] * TAILLE_CASE
+    res = rechercher(algo, depart, prise, diagonales, limite_ms())
+    appliquer_resultat(res)
+    chemin = res["chemin"] if res["statut"] != "aucun" else []
+    index = 1
+    etat = "attente"
+
+
+def remplacer_trajet(res, quittee):
+    """Adopte un nouveau trajet : [case quittée] + chemin trouvé depuis la case visée."""
+    global chemin, index
+    appliquer_resultat(res)
+    chemin = [quittee] + res["chemin"]
+    index = 1
+
+
+def meubles_aleatoires():
+    for l in range(nb_lignes):
+        for c in range(nb_colonnes):
+            if (l, c) in (depart, prise):
+                grille[l][c] = 0
+            else:
+                grille[l][c] = 1 if random.random() < densite_pct / 100 else 0
+
+
+def redimensionner(nouvelles_lignes, nouvelles_colonnes):
+    """Change la taille de la grille : garde les meubles existants,
+    remplit les nouvelles cases au hasard, et adapte la taille des cases."""
+    global nb_lignes, nb_colonnes, grille, prise
+    nouvelles_lignes = max(MIN_TAILLE, min(MAX_TAILLE, nouvelles_lignes))
+    nouvelles_colonnes = max(MIN_TAILLE, min(MAX_TAILLE, nouvelles_colonnes))
+    if (nouvelles_lignes, nouvelles_colonnes) == (nb_lignes, nb_colonnes):
+        return
+
+    ancienne = grille
+    anciennes_lignes, anciennes_colonnes = nb_lignes, nb_colonnes
+    nb_lignes, nb_colonnes = nouvelles_lignes, nouvelles_colonnes
+
+    grille = []
+    for l in range(nb_lignes):
+        ligne = []
+        for c in range(nb_colonnes):
+            if l < anciennes_lignes and c < anciennes_colonnes:
+                ligne.append(ancienne[l][c])
+            else:
+                ligne.append(1 if random.random() < densite_pct / 100 else 0)
+        grille.append(ligne)
+
+    prise = (nb_lignes - 1, nb_colonnes - 1)
+    grille[depart[0]][depart[1]] = 0
+    grille[prise[0]][prise[1]] = 0
+
+    calculer_dimensions()
+    print("Grille : %d lignes x %d colonnes (cases de %d px)" % (nb_lignes, nb_colonnes, TAILLE_CASE))
+
+
+def action_panneau(nom):
+    global algo, diagonales, montrer_zone, indice_limite, comparaison, densite_pct
+    if nom == "zone":
+        montrer_zone = not montrer_zone
+        return
+    if nom == "comparer":
+        comparaison = comparer_algos(depart, prise, diagonales, limite_ms())
+        return
+    if etat == "en_route":
+        return   # on ne change pas la configuration pendant le déplacement
+    if nom == "d_moins":     # la densité sera utilisée par « Aléatoire » (R)
+        densite_pct = max(0, densite_pct - 5)
+        return
+    if nom == "d_plus":
+        densite_pct = min(40, densite_pct + 5)
+        return
+    if nom.startswith("algo"):
+        algo = int(nom[4])
+    elif nom == "diag":
+        diagonales = not diagonales
+    elif nom == "moins":
+        indice_limite = max(0, indice_limite - 1)
+    elif nom == "plus":
+        indice_limite = min(len(LIMITES_MS) - 1, indice_limite + 1)
+    elif nom == "alea":
+        meubles_aleatoires()
+    elif nom == "l_moins":
+        redimensionner(nb_lignes - 1, nb_colonnes)
+    elif nom == "l_plus":
+        redimensionner(nb_lignes + 1, nb_colonnes)
+    elif nom == "c_moins":
+        redimensionner(nb_lignes, nb_colonnes - 1)
+    elif nom == "c_plus":
+        redimensionner(nb_lignes, nb_colonnes + 1)
+    comparaison = []
+    reinitialiser()
+
+
+def appuyer_bouton():
+    """Action du bouton Démarrer / Recommencer (aussi : Espace ou Entrée)."""
+    global etat, index
+    if etat == "attente":
+        if len(chemin) > 1:
+            etat = "en_route"
+            index = 1
+    elif etat in ("arrive", "coince"):
+        reinitialiser()
+
+
+meubles_aleatoires()
+reinitialiser()
+
+# ------------------------------------------------------------
+# Boucle principale
+# ------------------------------------------------------------
+continuer = True
+while continuer:
+    souris = vers_logique(pygame.mouse.get_pos())
+
+    for evenement in pygame.event.get():
+        if evenement.type == pygame.QUIT:
+            continuer = False
+
+        elif evenement.type == pygame.KEYDOWN:
+            if evenement.key in (pygame.K_F1, pygame.K_F2, pygame.K_F3, pygame.K_F4):
+                action_panneau("algo%d" % (evenement.key - pygame.K_F1))
+            elif evenement.key in (pygame.K_SPACE, pygame.K_RETURN, pygame.K_KP_ENTER):
+                appuyer_bouton()
+            elif evenement.key == pygame.K_d:
+                action_panneau("diag")
+            elif evenement.key == pygame.K_c:
+                action_panneau("comparer")
+            elif evenement.key == pygame.K_e:
+                action_panneau("zone")
+            elif evenement.key == pygame.K_m:
+                montrer_matrice = not montrer_matrice
+            elif evenement.key == pygame.K_r:
+                action_panneau("alea")
+            elif evenement.key == pygame.K_UP:
+                action_panneau("plus")
+            elif evenement.key == pygame.K_DOWN:
+                action_panneau("moins")
+            elif evenement.key == pygame.K_RIGHT:
+                action_panneau("c_plus")
+            elif evenement.key == pygame.K_LEFT:
+                action_panneau("c_moins")
+            elif evenement.key == pygame.K_PAGEUP:
+                action_panneau("l_plus")
+            elif evenement.key == pygame.K_PAGEDOWN:
+                action_panneau("l_moins")
+
+        elif evenement.type == pygame.MOUSEBUTTONDOWN and evenement.button == 1:
+            pos_clic = vers_logique(evenement.pos)
+            # ----- Bouton principal -----
+            if bouton.collidepoint(pos_clic):
+                appuyer_bouton()
+
+            # ----- Panneau de droite -----
+            elif pos_clic[0] >= LARGEUR_ZONE and pos_clic[1] < HAUTEUR_ZONE:
+                for nom, zone in boutons_panneau.items():
+                    if zone.collidepoint(pos_clic):
+                        action_panneau(nom)
+                        break
+
+            # ----- Clic sur la grille : ajouter / retirer un meuble -----
+            elif 0 <= pos_clic[0] < LARGEUR_PIX and 0 <= pos_clic[1] < HAUTEUR_PIX:
+                colonne = pos_clic[0] // TAILLE_CASE
+                ligne = pos_clic[1] // TAILLE_CASE
+                case = (ligne, colonne)
+
+                protegees = {depart, prise}
+                if etat in ("en_route", "coince"):
+                    a, b = chemin[index - 1], chemin[index]
+                    protegees.update([a, b])
+                    if a[0] != b[0] and a[1] != b[1]:   # segment diagonal en cours
+                        protegees.update([(a[0], b[1]), (b[0], a[1])])
+
+                if case not in protegees:
+                    grille[ligne][colonne] = 1 - grille[ligne][colonne]
+                    est_obstacle = (grille[ligne][colonne] == 1)
+                    comparaison = []
+
+                    if etat in ("attente", "arrive"):
+                        reinitialiser()
+
+                    elif etat in ("en_route", "coince"):
+                        quittee = chemin[index - 1]
+                        visee = chemin[index]
+                        coupe = not chemin_valide(chemin, index)
+
+                        if coupe or etat == "coince":
+                            # Le chemin est coupé (ou le robot est bloqué) : recalcul obligatoire
+                            res = rechercher(algo, visee, prise, diagonales, limite_ms())
+                            if res["statut"] != "aucun":
+                                remplacer_trajet(res, quittee)
+                                etat = "en_route"
+                            else:
+                                appliquer_resultat(res)
+                                etat = "coince"
+                        elif not est_obstacle:
+                            # Un meuble a disparu : un chemin plus court existe peut-être
+                            res = rechercher(algo, visee, prise, diagonales, limite_ms())
+                            if res["statut"] != "aucun":
+                                reste = cout_chemin(chemin[index:])
+                                chemin_incomplet = chemin[-1] != prise
+                                meilleur = (res["statut"] == "ok"
+                                            and res["cout"] < reste - 1e-9)
+                                if meilleur or (chemin_incomplet and res["statut"] == "ok"):
+                                    remplacer_trajet(res, quittee)
+
+    # --- Déplacement du robot ---
+    if etat == "en_route":
+        cible_x = chemin[index][1] * TAILLE_CASE
+        cible_y = chemin[index][0] * TAILLE_CASE
+        dx = cible_x - robot_x
+        dy = cible_y - robot_y
+        distance = (dx ** 2 + dy ** 2) ** 0.5
+        if distance <= VITESSE:
+            robot_x, robot_y = cible_x, cible_y
+            index += 1
+            if index >= len(chemin):
+                if chemin[-1] == prise:
+                    etat = "arrive"
+                else:
+                    # Chemin partiel (temps dépassé) : on recalcule depuis ici
+                    res = rechercher(algo, chemin[-1], prise, diagonales, limite_ms())
+                    if res["statut"] != "aucun" and len(res["chemin"]) > 1:
+                        remplacer_trajet(res, chemin[-1])
+                    else:
+                        appliquer_resultat(res)
+                        etat = "coince"
+        else:
+            robot_x += VITESSE * dx / distance
+            robot_y += VITESSE * dy / distance
+
+    # --- Dessin de la grille ---
+    fenetre.fill(FOND)
+    for ligne in range(nb_lignes):
+        for colonne in range(nb_colonnes):
+            x = colonne * TAILLE_CASE
+            y = ligne * TAILLE_CASE
+            if grille[ligne][colonne] == 1:
+                dessiner_sol(fenetre, x, y, ligne, colonne)
+                dessiner_meuble(fenetre, x, y)
+            else:
+                dessiner_sol(fenetre, x, y, ligne, colonne)
+
+    if montrer_zone and zone_explorée:
+        voile = pygame.Surface((TAILLE_CASE, TAILLE_CASE), pygame.SRCALPHA)
+        voile.fill((60, 200, 140, 70))
+        for (l, c) in zone_explorée:
+            if grille[l][c] == 0:
+                fenetre.blit(voile, (c * TAILLE_CASE, l * TAILLE_CASE))
+
+    dessiner_lignes_grille(fenetre)
+
+    if montrer_matrice:
+        dessiner_matrice(fenetre, police_petite_gras)
+
+    if etat in ("attente", "en_route") and chemin:
+        points = [(int(robot_x + TAILLE_CASE / 2), int(robot_y + TAILLE_CASE / 2))]
+        for (l, c) in chemin[index:]:
+            points.append(centre_case(l, c))
+        partiel = chemin[-1] != prise
+        dessiner_chemin(fenetre, points, CHEMIN_PARTIEL if partiel else CHEMIN)
+
+    dessiner_prise(fenetre, prise[1] * TAILLE_CASE, prise[0] * TAILLE_CASE)
+    dessiner_robot(fenetre, robot_x, robot_y)
+
+    # --- Panneau de droite ---
+    pygame.draw.rect(fenetre, PANNEAU, rect(LARGEUR_ZONE, 0, LARGEUR_PANNEAU, HAUTEUR_ZONE))
+    fenetre.blit(police_petite_gras.render("Algorithme (F1 à F4)", True, TEXTE), (PX, DEC + 8))
+    for i in range(4):
+        couleur = BOUTON_ACTIF if algo == i else BOUTON_PANNEAU
+        dessiner_bouton(fenetre, police_petite, boutons_panneau["algo%d" % i], NOMS_ALGOS[i], couleur)
+    dessiner_bouton(fenetre, police_petite, boutons_panneau["diag"],
+                    "Diagonales (D) : " + ("oui" if diagonales else "non"), BOUTON_PANNEAU)
+    dessiner_bouton(fenetre, police_petite, boutons_panneau["zone"],
+                    "Cases explorées (E) : " + ("oui" if montrer_zone else "non"), BOUTON_PANNEAU)
+    dessiner_bouton(fenetre, police_petite, boutons_panneau["comparer"], "Comparer (C)", BOUTON_PANNEAU)
+    dessiner_bouton(fenetre, police_petite, boutons_panneau["alea"], "Aléatoire (R)", BOUTON_PANNEAU)
+
+    fenetre.blit(police_petite.render("Limite de calcul : %s ms" % limite_ms(), True, TEXTE), (PX, Y_LIMITE + 5))
+    dessiner_bouton(fenetre, police_petite, boutons_panneau["moins"], "-", BOUTON_PANNEAU)
+    dessiner_bouton(fenetre, police_petite, boutons_panneau["plus"], "+", BOUTON_PANNEAU)
+
+    # Réglages de la grille
+    fenetre.blit(police_petite.render("Lignes : %d" % nb_lignes, True, TEXTE), (PX, Y_LIGNES + 5))
+    dessiner_bouton(fenetre, police_petite, boutons_panneau["l_moins"], "-", BOUTON_PANNEAU)
+    dessiner_bouton(fenetre, police_petite, boutons_panneau["l_plus"], "+", BOUTON_PANNEAU)
+    fenetre.blit(police_petite.render("Colonnes : %d" % nb_colonnes, True, TEXTE), (PX, Y_COLONNES + 5))
+    dessiner_bouton(fenetre, police_petite, boutons_panneau["c_moins"], "-", BOUTON_PANNEAU)
+    dessiner_bouton(fenetre, police_petite, boutons_panneau["c_plus"], "+", BOUTON_PANNEAU)
+    fenetre.blit(police_petite.render("Meubles : %d %%" % densite_pct, True, TEXTE), (PX, Y_DENSITE + 5))
+    dessiner_bouton(fenetre, police_petite, boutons_panneau["d_moins"], "-", BOUTON_PANNEAU)
+    dessiner_bouton(fenetre, police_petite, boutons_panneau["d_plus"], "+", BOUTON_PANNEAU)
+
+    y = DEC + 318
+    fenetre.blit(police_petite_gras.render("Dernière recherche", True, TEXTE), (PX, y))
+    if stats:
+        lignes = [
+            "Statut : %s" % stats["statut"],
+            "Temps : %.3f ms" % stats["temps"],
+            "Longueur : %.2f" % stats["cout"],
+            "Cases explorées : %d" % stats["explores"],
+        ]
+        for k, texte in enumerate(lignes):
+            fenetre.blit(police_petite.render(texte, True, TEXTE_DISCRET), (PX, y + 18 + k * 16))
+
+    y = DEC + 412
+    if comparaison:
+        fenetre.blit(police_petite_gras.render("Comparaison (départ -> prise)", True, TEXTE), (PX, y))
+        fenetre.blit(police_petite.render("Algo     ms      long.   expl.", True, TEXTE_DISCRET), (PX, y + 18))
+        for k, (nom, t, c, e, s) in enumerate(comparaison):
+            ligne_txt = "%-8s %-7.3f %-7.2f %d%s" % (nom, t, c, e, "" if s == "ok" else " (%s)" % s)
+            fenetre.blit(police_petite.render(ligne_txt, True, TEXTE), (PX, y + 36 + k * 16))
+    else:
+        fenetre.blit(police_petite.render("Clic sur la grille : meuble", True, TEXTE_DISCRET), (PX, y))
+        fenetre.blit(police_petite.render("Violet = chemin partiel (temps dépassé)", True, TEXTE_DISCRET), (PX, y + 18))
+        fenetre.blit(police_petite.render("M : afficher la matrice (0 / 1)", True, TEXTE_DISCRET), (PX, y + 36))
+        fenetre.blit(police_petite.render("Meubles % : appliqué par « Aléatoire »", True, TEXTE_DISCRET), (PX, y + 54))
+        fenetre.blit(police_petite.render("Flèches gauche/droite : colonnes", True, TEXTE_DISCRET), (PX, y + 72))
+        fenetre.blit(police_petite.render("Page haut/bas : lignes", True, TEXTE_DISCRET), (PX, y + 90))
+
+    # --- Barre du bas ---
+    if etat == "attente":
+        if len(chemin) > 1:
+            if chemin[-1] != prise:
+                message = "Chemin partiel (temps dépassé)"
+            else:
+                message = "Prêt : Démarrer (ou Espace)"
+            texte_bouton, actif = "Démarrer", True
+        else:
+            message, texte_bouton, actif = "La prise est inaccessible", "Démarrer", False
+    elif etat == "en_route":
+        message, texte_bouton, actif = "Le robot cherche sa prise...", "En cours...", False
+    elif etat == "coince":
+        message, texte_bouton, actif = "Chemin bloqué !", "Recommencer", True
+    else:
+        message, texte_bouton, actif = "Branché ! Batterie en charge", "Recommencer", True
+
+    fenetre.blit(police_petite_gras.render(message, True, TEXTE), (PX, 6))
+    survol = actif and bouton.collidepoint(souris)
+    couleur = BOUTON_GRIS if not actif else (BOUTON_SURVOL if survol else BOUTON)
+    dessiner_bouton(fenetre, police, bouton, texte_bouton, couleur)
+
+    ecran, echelle, decalage, taille = geometrie_affichage()
+    ecran.fill((0, 0, 0))
+    if taille == (LARGEUR, HAUTEUR):
+        ecran.blit(fenetre, decalage)
+    else:
+        ecran.blit(pygame.transform.smoothscale(fenetre, taille), decalage)
+    pygame.display.flip()
+    horloge.tick(60)
+
+pygame.quit()
+
