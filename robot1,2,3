@@ -1,0 +1,360 @@
+"""
+Theme 2 : Navigation intelligente d'un robot dans un environnement dynamique
+Un SEUL algorithme : A* (A etoile) - optimal : il donne toujours le plus court chemin.
+
+  - Niveau 1 : le robot trouve le plus court chemin entre son depart et la destination.
+  - Niveau 2 : les obstacles apparaissent et disparaissent AU HASARD pendant le trajet ;
+               si le chemin est bloque, le robot recalcule un nouveau chemin.
+  - Niveau 3 : le temps de calcul est mesure et affiche (compare a T(m) = 60 + m*ln(m/60) ms).
+               Quand un obstacle disparait, on ne recalcule que si un raccourci est possible.
+
+Lancer :  python robot_navigation.py
+"""
+
+import heapq
+import math
+import random
+import time
+import tkinter as tk
+
+# ----------------------------------------------------------------------
+# PARAMETRES
+# ----------------------------------------------------------------------
+N = 60                  # grille N x N (minimum exige : 60 x 60)
+CASE = 10               # taille d'une case en pixels  -> grille de 600 x 600
+DENSITE_INITIALE = 0.15 # 15 % d'obstacles au depart
+DENSITE_MAX = 0.25      # jamais plus de 25 % d'obstacles
+LIBRE, OBSTACLE = 0, 1
+DIRECTIONS = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+
+# Couleurs
+FOND = "#1e2430"
+PANNEAU = "#272e3d"
+TEXTE = "#e8ecf3"
+TEXTE_DISCRET = "#8b96ab"
+CASE_LIBRE = "#f4f6fa"
+OBSTACLE_C = "#3b4558"
+DEPART_C = "#2ecc71"
+ARRIVEE_C = "#ff5c5c"
+CHEMIN_C = "#3b82f6"
+ROBOT_C = "#ffb020"
+VERT = "#2ecc71"
+ROUGE = "#ff5c5c"
+BLEU = "#3b82f6"
+GRIS = "#4a5568"
+
+F = "Segoe UI"
+
+
+# ----------------------------------------------------------------------
+# ALGORITHME A*  (aucune interface ici)
+# ----------------------------------------------------------------------
+def heuristique(a, b):
+    """Distance de Manhattan : estimation optimiste du nombre de pas restants."""
+    return abs(a[0] - b[0]) + abs(a[1] - b[1])
+
+
+def limite_temps_ms(m):
+    """Limite de l'enonce : T(m) = 60 + m * ln(m / 60) ms."""
+    return 60 + m * math.log(m / 60)
+
+
+def astar(grille, depart, arrivee):
+    """Retourne (chemin, nb_cases_explorees). chemin = [depart, ..., arrivee] (le plus court)
+    ou None si la destination est inaccessible."""
+    ouverte = [(heuristique(depart, arrivee), 0, depart)]   # (f, -g, case)
+    parent = {depart: None}
+    cout = {depart: 0}
+    fermees = set()
+
+    while ouverte:
+        _, moins_g, courante = heapq.heappop(ouverte)
+        if courante in fermees:
+            continue
+        fermees.add(courante)
+        g = -moins_g
+
+        if courante == arrivee:
+            chemin = []
+            while courante is not None:
+                chemin.append(courante)
+                courante = parent[courante]
+            chemin.reverse()
+            return chemin, len(fermees)
+
+        l, c = courante
+        for dl, dc in DIRECTIONS:
+            nl, nc = l + dl, c + dc
+            if 0 <= nl < N and 0 <= nc < N and grille[nl][nc] == LIBRE:
+                v = (nl, nc)
+                ng = g + 1
+                if ng < cout.get(v, 1e9):
+                    cout[v] = ng
+                    parent[v] = courante
+                    heapq.heappush(ouverte, (ng + heuristique(v, arrivee), -ng, v))
+    return None, len(fermees)
+
+
+# ----------------------------------------------------------------------
+# APPLICATION
+# ----------------------------------------------------------------------
+class App:
+    def __init__(self, racine):
+        self.racine = racine
+        racine.title("Robot autonome - A*")
+        racine.configure(bg=FOND)
+        racine.resizable(False, False)
+
+        self.grille = [[LIBRE] * N for _ in range(N)]
+        self.depart = (3, 3)
+        self.arrivee = (N - 4, N - 4)
+        self.robot = self.depart
+        self.chemin = []
+        self.en_route = False
+        self.tache = None
+        self.disparus = []
+        self.nb_pas = 0
+        self.nb_recalculs = 0
+        self.temps = []
+
+        self.construire()
+        self.generer_obstacles()
+
+    # ---------- interface ----------
+    def construire(self):
+        self.canevas = tk.Canvas(self.racine, width=N * CASE, height=N * CASE,
+                                 bg=CASE_LIBRE, highlightthickness=0)
+        self.canevas.grid(row=0, column=0, padx=(12, 6), pady=12)
+        self.canevas.bind("<Button-1>", self.clic)
+
+        self.rects = [[self.canevas.create_rectangle(
+            c * CASE, l * CASE, (c + 1) * CASE, (l + 1) * CASE,
+            fill=CASE_LIBRE, outline="#e3e7ee") for c in range(N)] for l in range(N)]
+
+        p = tk.Frame(self.racine, bg=PANNEAU, padx=14, pady=12, width=230)
+        p.grid(row=0, column=1, sticky="ns", padx=(6, 12), pady=12)
+        p.pack_propagate(False)
+        p.grid_propagate(False)
+
+        tk.Label(p, text="Robot autonome", font=(F, 15, "bold"), bg=PANNEAU, fg=TEXTE).pack(anchor="w")
+        tk.Label(p, text="Navigation avec l'algorithme A*", font=(F, 9), bg=PANNEAU,
+                 fg=TEXTE_DISCRET).pack(anchor="w", pady=(0, 10))
+
+        # Temps de calcul (le resultat principal)
+        tk.Label(p, text="TEMPS DE CALCUL DU CHEMIN", font=(F, 8, "bold"), bg=PANNEAU,
+                 fg=TEXTE_DISCRET).pack(anchor="w")
+        self.v_temps = tk.StringVar(value="-- ms")
+        self.l_temps = tk.Label(p, textvariable=self.v_temps, font=(F, 28, "bold"),
+                                bg=PANNEAU, fg=VERT)
+        self.l_temps.pack(anchor="w")
+        self.v_limite = tk.StringVar(value=f"limite autorisee : {limite_temps_ms(N):.0f} ms")
+        tk.Label(p, textvariable=self.v_limite, font=(F, 9), bg=PANNEAU,
+                 fg=TEXTE_DISCRET).pack(anchor="w", pady=(0, 8))
+
+        # Statistiques
+        self.v_long = tk.StringVar()
+        self.v_moy = tk.StringVar()
+        self.v_recalc = tk.StringVar()
+        self.v_obst = tk.StringVar()
+        for v in (self.v_long, self.v_moy, self.v_recalc, self.v_obst):
+            tk.Label(p, textvariable=v, font=(F, 10), bg=PANNEAU, fg=TEXTE).pack(anchor="w", pady=1)
+
+        # Boutons
+        tk.Frame(p, bg=PANNEAU, height=10).pack()
+        self.b_start = self.bouton(p, "Demarrer", VERT, self.demarrer_pause)
+        self.b_start.pack(fill="x", pady=2)
+        self.bouton(p, "Remettre au depart", GRIS, self.remettre).pack(fill="x", pady=2)
+        self.bouton(p, "Nouveaux obstacles", GRIS, self.generer_obstacles).pack(fill="x", pady=2)
+
+        # Vitesse
+        tk.Label(p, text="Vitesse du robot", font=(F, 9), bg=PANNEAU,
+                 fg=TEXTE_DISCRET).pack(anchor="w", pady=(10, 0))
+        self.vitesse = tk.IntVar(value=5)
+        tk.Scale(p, from_=1, to=10, orient="horizontal", variable=self.vitesse,
+                 showvalue=False, bg=PANNEAU, fg=TEXTE, troughcolor=GRIS,
+                 highlightthickness=0, bd=0, activebackground=BLEU).pack(fill="x")
+
+        # Legende
+        leg = tk.Frame(p, bg=PANNEAU)
+        leg.pack(anchor="w", pady=(10, 0))
+        for i, (t, col) in enumerate([("Robot", ROBOT_C), ("Depart", DEPART_C), ("Arrivee", ARRIVEE_C),
+                                      ("Obstacle", OBSTACLE_C), ("Chemin", CHEMIN_C)]):
+            tk.Label(leg, bg=col, width=2).grid(row=i // 2, column=(i % 2) * 2, padx=(0, 4), pady=2)
+            tk.Label(leg, text=t, font=(F, 9), bg=PANNEAU, fg=TEXTE).grid(
+                row=i // 2, column=(i % 2) * 2 + 1, sticky="w", padx=(0, 12))
+
+        self.v_msg = tk.StringVar()
+        tk.Label(p, textvariable=self.v_msg, font=(F, 9, "bold"), bg=PANNEAU, fg=ROBOT_C,
+                 wraplength=200, justify="left").pack(anchor="w", pady=(12, 0))
+        tk.Label(p, text="Astuce : cliquez sur la grille pour\nchanger la destination.",
+                 font=(F, 8), bg=PANNEAU, fg=TEXTE_DISCRET, justify="left").pack(
+            side="bottom", anchor="w")
+
+    def bouton(self, parent, texte, couleur, commande):
+        return tk.Button(parent, text=texte, command=commande, bg=couleur, fg="white",
+                         activebackground=couleur, activeforeground="white", relief="flat",
+                         bd=0, font=(F, 10, "bold"), cursor="hand2", pady=6)
+
+    # ---------- dessin ----------
+    def couleur(self, cel):
+        if cel == self.depart:
+            return DEPART_C
+        if cel == self.arrivee:
+            return ARRIVEE_C
+        return OBSTACLE_C if self.grille[cel[0]][cel[1]] == OBSTACLE else CASE_LIBRE
+
+    def maj_case(self, cel):
+        self.canevas.itemconfig(self.rects[cel[0]][cel[1]], fill=self.couleur(cel))
+
+    def centre(self, cel):
+        return cel[1] * CASE + CASE // 2, cel[0] * CASE + CASE // 2
+
+    def dessiner_robot(self):
+        self.canevas.delete("dyn")
+        if self.chemin:
+            pts = [self.centre(self.robot)] + [self.centre(c) for c in self.chemin]
+            self.canevas.create_line(*[v for pt in pts for v in pt], fill=CHEMIN_C,
+                                     width=3, tags="dyn")
+        x, y = self.centre(self.robot)
+        r = CASE // 2 - 1
+        self.canevas.create_oval(x - r, y - r, x + r, y + r, fill=ROBOT_C,
+                                 outline="#7a5200", width=1, tags="dyn")
+
+    def maj_stats(self):
+        n_obs = sum(row.count(OBSTACLE) for row in self.grille)
+        moy = sum(self.temps) / len(self.temps) if self.temps else 0
+        self.v_long.set(f"Chemin restant : {len(self.chemin)} pas")
+        self.v_moy.set(f"Temps moyen : {moy:.2f} ms" if self.temps else "Temps moyen : --")
+        self.v_recalc.set(f"Recalculs : {self.nb_recalculs}")
+        self.v_obst.set(f"Obstacles : {n_obs / (N * N) * 100:.0f} %")
+
+    # ---------- calcul du chemin (mesure du temps) ----------
+    def calculer(self):
+        debut = time.perf_counter()
+        chemin, _ = astar(self.grille, self.robot, self.arrivee)
+        ms = (time.perf_counter() - debut) * 1000
+        self.temps.append(ms)
+        self.v_temps.set(f"{ms:.2f} ms")
+        self.l_temps.config(fg=VERT if ms <= limite_temps_ms(N) else ROUGE)
+        if chemin is None:
+            self.chemin = []
+            self.v_msg.set("Aucun chemin pour l'instant...")
+        else:
+            self.chemin = chemin[1:]
+            self.v_msg.set("Plus court chemin trouve.")
+        self.dessiner_robot()
+        self.maj_stats()
+        return chemin is not None
+
+    # ---------- obstacles aleatoires ----------
+    def generer_obstacles(self):
+        self.arreter()
+        for l in range(N):
+            for c in range(N):
+                libre = (l, c) in (self.depart, self.arrivee) or random.random() >= DENSITE_INITIALE
+                self.grille[l][c] = LIBRE if libre else OBSTACLE
+                self.maj_case((l, c))
+        self.remettre()
+
+    def changer_obstacles(self):
+        """Environnement dynamique : a chaque pas, des obstacles disparaissent et d'autres
+        apparaissent a des endroits tires au hasard."""
+        obstacles = [(l, c) for l in range(N) for c in range(N) if self.grille[l][c] == OBSTACLE]
+        protege = (self.robot, self.depart, self.arrivee)
+
+        for _ in range(random.randint(2, 5)):             # disparitions
+            if obstacles:
+                cel = obstacles.pop(random.randrange(len(obstacles)))
+                self.grille[cel[0]][cel[1]] = LIBRE
+                self.disparus.append(cel)
+                self.maj_case(cel)
+
+        for _ in range(random.randint(2, 5)):             # apparitions
+            if len(obstacles) >= DENSITE_MAX * N * N:
+                break
+            cel = (random.randrange(N), random.randrange(N))
+            if self.grille[cel[0]][cel[1]] == LIBRE and cel not in protege:
+                self.grille[cel[0]][cel[1]] = OBSTACLE
+                obstacles.append(cel)
+                self.maj_case(cel)
+
+    def chemin_bloque(self):
+        if not self.chemin:
+            return self.robot != self.arrivee
+        return any(self.grille[l][c] == OBSTACLE for l, c in self.chemin)
+
+    def raccourci_possible(self):
+        """Un obstacle disparu ne peut raccourcir le chemin que si
+        h(robot, x) + h(x, arrivee) < longueur du chemin actuel."""
+        return any(heuristique(self.robot, x) + heuristique(x, self.arrivee) < len(self.chemin)
+                   for x in self.disparus)
+
+    # ---------- deplacement ----------
+    def demarrer_pause(self):
+        if self.en_route:
+            self.arreter()
+            return
+        if self.robot == self.arrivee:
+            self.remettre()
+        self.en_route = True
+        self.b_start.config(text="Pause", bg=ROUGE, activebackground=ROUGE)
+        self.pas()
+
+    def arreter(self):
+        self.en_route = False
+        if self.tache is not None:
+            self.racine.after_cancel(self.tache)
+            self.tache = None
+        if hasattr(self, "b_start"):
+            self.b_start.config(text="Demarrer", bg=VERT, activebackground=VERT)
+
+    def pas(self):
+        if not self.en_route:
+            return
+        self.changer_obstacles()
+
+        bloque = self.chemin_bloque()
+        raccourci = (not bloque) and self.raccourci_possible()
+        self.disparus = []
+        if bloque or raccourci:
+            self.nb_recalculs += 1
+            self.calculer()
+
+        if self.chemin:
+            self.robot = self.chemin.pop(0)
+            self.nb_pas += 1
+            self.dessiner_robot()
+            self.maj_stats()
+
+        if self.robot == self.arrivee:
+            self.arreter()
+            self.v_msg.set(f"Destination atteinte en {self.nb_pas} pas !")
+            return
+        self.tache = self.racine.after(int(500 / self.vitesse.get()), self.pas)
+
+    def remettre(self):
+        self.arreter()
+        self.robot = self.depart
+        self.nb_pas = 0
+        self.nb_recalculs = 0
+        self.temps = []
+        self.disparus = []
+        self.calculer()
+        self.v_msg.set("Pret : cliquez sur Demarrer.")
+
+    def clic(self, ev):
+        c, l = ev.x // CASE, ev.y // CASE
+        if not (0 <= l < N and 0 <= c < N) or (l, c) in (self.robot, self.depart):
+            return
+        ancienne = self.arrivee
+        self.grille[l][c] = LIBRE
+        self.arrivee = (l, c)
+        self.maj_case(ancienne)
+        self.maj_case(self.arrivee)
+        self.calculer()
+
+
+if __name__ == "__main__":
+    fenetre = tk.Tk()
+    App(fenetre)
+    fenetre.mainloop()
